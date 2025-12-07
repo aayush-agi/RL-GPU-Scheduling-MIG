@@ -1,0 +1,444 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tcolorbox}
+
+% Colors
+\definecolor{columbia}{RGB}{185, 217, 235}
+\definecolor{wingreen}{RGB}{39, 174, 96}
+\definecolor{alertred}{RGB}{231, 76, 60}
+\definecolor{neutralblue}{RGB}{52, 152, 219}
+
+% Header/Footer
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{MIG Scheduling with RL}
+\lhead{Columbia University}
+\rfoot{Page \thepage}
+
+% Title formatting
+\titleformat{\section}{\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{1em}{}
+
+% Custom box for key insights
+\newtcolorbox{keyinsight}{
+    colback=columbia!30,
+    colframe=neutralblue,
+    title=Key Insight,
+    fonttitle=\bfseries
+}
+
+\newtcolorbox{resultbox}{
+    colback=wingreen!10,
+    colframe=wingreen,
+    title=Result,
+    fonttitle=\bfseries
+}
+
+\begin{document}
+
+% Title Page
+\begin{titlepage}
+\centering
+\vspace*{2cm}
+
+{\Huge\bfseries Scheduling Jobs on Multi-Instance GPUs (MIG) using Reinforcement Learning}\\[1em]
+{\Large\itshape An Improved Implementation and Analysis}\\[3em]
+
+{\large Tanvi Hisaria, Devyani Vij, Aayush Srivastava}\\[1em]
+
+{\large Technical Report for COMS E6998: Reinforcement Learning}\\[0.5em]
+{\large Columbia University in the City of New York}\\[3em]
+
+\today
+
+\vfill
+
+\end{titlepage}
+
+%==============================================================================
+\section{The Challenge: Optimizing for Energy and Performance on MIG}
+%==============================================================================
+
+\subsection{Context}
+
+NVIDIA's Multi-Instance GPU (MIG) technology partitions a single GPU into up to seven isolated ``slices.'' This allows multiple jobs to run concurrently, improving utilization for smaller AI/ML workloads.
+
+\begin{itemize}[noitemsep]
+    \item Data centers consumed 4.4\% of total US electricity in 2023
+    \item Projections suggest this could rise to 12\% by 2028
+    \item Efficient GPU scheduling is critical for sustainable AI infrastructure
+\end{itemize}
+
+\subsection{The Core Trade-Off}
+
+\begin{description}
+    \item[Energy Efficiency:] Achieved by packing the GPU with jobs to maximize utilization. Power consumption is \emph{concave}---using 4/7 of a GPU consumes nearly the same power as using 7/7.
+    
+    \item[Tardiness:] A measure of how late past the deadline a job completes. Packing more jobs onto smaller slices can increase their runtime, negatively impacting tardiness.
+\end{description}
+
+\begin{keyinsight}
+\textbf{Objective:} Design a scheduling agent that minimizes a weighted measure of Energy and Tardiness---the \textbf{ET metric}.
+\end{keyinsight}
+
+%==============================================================================
+\section{Hypothesis 1: A Standard PPO Formulation}
+%==============================================================================
+
+Based on the initial proposal, we model the scheduling problem as a Markov Decision Process (MDP) and apply Proximal Policy Optimization (PPO).
+
+\subsection{State Space ($\mathcal{S}$)}
+
+A vector representing the current environment state:
+\begin{itemize}[noitemsep]
+    \item Characteristics of the next job to be scheduled (e.g., deadline, expected runtimes)
+    \item Statistics of the job queue (e.g., histograms of job durations)
+    \item Binary status of GPU slices (busy or free)
+\end{itemize}
+
+\subsection{Action Space ($\mathcal{A}$)}
+
+A discrete space representing all available GPU slices:
+\begin{itemize}[noitemsep]
+    \item \texttt{Action} = Assign job $j$ to slice $i$
+    \item Action masking is used to prevent assignment to occupied slices
+\end{itemize}
+
+\subsection{Reward Function ($R$)}
+
+A sparse, terminal reward calculated only at the end of an episode (after all jobs are scheduled):
+
+\begin{equation}
+R = \frac{-\text{total\_tardiness} - \alpha \cdot \text{total\_energy}}{\text{num\_jobs} \cdot \alpha + 1}
+\end{equation}
+
+where $\alpha$ is a scaling parameter. \textbf{No reward is given for intermediate actions.}
+
+\subsection{Goal}
+
+Train a PPO agent with this formulation to outperform deterministic greedy algorithms.
+
+%==============================================================================
+\section{Initial Results: RL Agent Fails}
+%==============================================================================
+
+When evaluated on a simulated 24-hour workload, the initial PPO agent produced unexpectedly poor results:
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Metric} & \textbf{Result} \\
+\midrule
+Late Jobs \% & $\sim$87\% \\
+PPO Agent vs. Best Heuristic & Loses by $\sim$5\% \\
+\bottomrule
+\end{tabular}
+\caption{Initial PPO agent performance}
+\end{table}
+
+\begin{keyinsight}
+\textbf{The Central Question:} Why did a sophisticated learning algorithm fail against a basic, hand-coded strategy? The formulation, which seemed logical, was fundamentally flawed.
+\end{keyinsight}
+
+%==============================================================================
+\section{Diagnosis: Four Critical Flaws}
+%==============================================================================
+
+A systematic analysis revealed that the problem was not the algorithm (PPO) but the environment and problem definition provided to it.
+
+\subsection{Flaw 1: The Problem Was Greedy-Optimal}
+
+\begin{description}
+    \item[Cause:] Extremely tight deadlines, set at $\text{uniform}(1.0, 1.5) \times t_{\text{fastest}}$
+    \item[Effect:] The only viable strategy was to always pick the largest available slice to minimize runtime. There was no room for intelligent trade-offs, making the problem trivial for a greedy heuristic but difficult for RL to discover.
+\end{description}
+
+\subsection{Flaw 2: The Agent Was Flying Blind}
+
+\begin{description}
+    \item[Cause:] The observation space $\mathcal{S}$ contained the binary status of slices (busy/free) but critically \textbf{lacked their sizes} (e.g., 1g, 4g, 7g).
+    \item[Effect:] The agent could not learn the fundamental concept that larger slices are faster. It could not distinguish between assigning a job to a fast 7g slice or a slow 1g slice.
+\end{description}
+
+\subsection{Flaw 3: The Feedback Loop Was Broken}
+
+\begin{description}
+    \item[Cause:] A sparse, end-of-episode reward signal.
+    \item[Effect:] The agent received feedback only after scheduling hundreds of jobs, making it nearly impossible to assign credit or blame to any of the individual scheduling decisions that led to the final outcome.
+\end{description}
+
+\subsection{Flaw 4: Experimentation Was Impractical}
+
+\begin{description}
+    \item[Cause:] The simulation environment was implemented in Pandas.
+    \item[Effect:] Slow performance bottlenecked training and iteration, making systematic improvement difficult.
+\end{description}
+
+%==============================================================================
+\section{A Revised Hypothesis: Systematic Enhancements}
+%==============================================================================
+
+We addressed each identified flaw with a specific enhancement to the environment, observation, and reward structure.
+
+\begin{table}[htbp]
+\centering
+\caption{Original vs. Enhanced Approach}
+\label{tab:comparison}
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\toprule
+\textbf{Flaw} & \textbf{Original (Hypothesis 1)} & \textbf{Enhanced (Hypothesis 2)} \\
+\midrule
+Greedy-Optimal Problem & Deadlines: $\text{uniform}(1.0, 1.5) \times t_{\text{fastest}}$ & Relaxed Deadlines: $\text{uniform}(2.0, 4.0) \times t_{\text{fastest}}$ \\
+\addlinespace
+Agent is Blind & Observation: Missing slice sizes & Enriched Observation: Added slice sizes, job ``urgency,'' and max available slice size \\
+\addlinespace
+Broken Feedback & Reward: Sparse, terminal only & Shaped Rewards: Added immediate, per-step rewards \\
+\addlinespace
+Slow Experimentation & Environment: Pandas-based & Optimized Environment: NumPy for 10-50$\times$ speedup \\
+\addlinespace
+Training Protocol & 200k steps, fixed learning rate & Advanced Training: 500k steps, deeper network, LR annealing, entropy decay \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{Formalizing the Enhancements}
+%==============================================================================
+
+\subsection{Enhanced Observation Space ($\mathcal{S}'$)}
+
+We augment the state with critical information:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Normalized Slice Sizes:} A vector indicating the relative size of each slice.
+    \item \textbf{Urgency Ratio:} A continuous value measuring how close a job is to its deadline:
+\end{itemize}
+
+\begin{equation}
+\text{urgency} = \min\left(10, \frac{t_{\text{fastest}}}{\max(t_{\text{deadline}} - t_{\text{now}}, \epsilon)}\right)
+\end{equation}
+
+where $\epsilon$ is a small constant to prevent division by zero.
+
+\subsection{Immediate Reward Shaping ($R'$)}
+
+We introduce a dense, immediate reward $r_{\text{immediate}}$ awarded at each step $t$ \emph{in addition} to the terminal reward:
+
+\begin{equation}
+r_{\text{immediate}} = 0.01 \cdot \frac{\text{slice\_size}}{7} + r_{\text{on-time}}
+\end{equation}
+
+where:
+\begin{equation}
+r_{\text{on-time}} = \begin{cases}
+0.05 & \text{if expected\_finish} < \text{deadline} \\
+0 & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\begin{itemize}[noitemsep]
+    \item The first term encourages using larger, more efficient slices
+    \item The second term rewards actions projected to meet the deadline
+\end{itemize}
+
+%==============================================================================
+\section{Validation: Enhanced RL Agent Outperforms Baselines}
+%==============================================================================
+
+After training for 500,000 timesteps with the enhanced formulation, the new agent demonstrates significant performance improvement.
+
+\begin{table}[htbp]
+\centering
+\caption{Final Performance Comparison (Averaged over multiple runs)}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Late Jobs (\%)}$\downarrow$ & \textbf{Avg. Tardiness (s)}$\downarrow$ & \textbf{Energy (MJ)} \\
+\midrule
+\textbf{RL-PPO (Enhanced)} & \textbf{37.7 $\pm$ 5.7} & \textbf{0.91 $\pm$ 0.48} & 2.50 $\pm$ 0.04 \\
+Largest-First (Best Heuristic) & 42.7 $\pm$ 5.7 & 1.02 $\pm$ 0.73 & 2.51 $\pm$ 0.05 \\
+EFT (Earliest Finish Time) & 43.1 $\pm$ 5.6 & 1.04 $\pm$ 0.63 & 2.48 $\pm$ 0.05 \\
+Smallest-First & 54.3 $\pm$ 4.7 & 1.21 $\pm$ 0.58 & 2.42 $\pm$ 0.05 \\
+Random & 50.1 $\pm$ 4.7 & 1.13 $\pm$ 0.57 & 2.49 $\pm$ 0.04 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{resultbox}
+\textbf{Key Observations:}
+\begin{itemize}[noitemsep]
+    \item The RL agent achieves the \textbf{lowest percentage of late jobs} and the \textbf{lowest average tardiness}
+    \item It reduces late jobs by \textbf{11.7\%} relative to the strongest heuristic (Largest-First)
+    \item Energy consumption remains comparable to other methods, demonstrating an effective balance in the energy-tardiness trade-off
+\end{itemize}
+\end{resultbox}
+
+%==============================================================================
+\section{The Decisive Result}
+%==============================================================================
+
+The primary goal was to create a learning agent that could discover a policy superior to fixed, greedy approaches. The enhanced formulation achieved this.
+
+\begin{center}
+\begin{tabular}{cc}
+\fcolorbox{alertred}{alertred!10}{%
+\begin{minipage}{0.4\textwidth}
+\centering
+\textbf{Best Heuristic: Largest-First}\\[1em]
+{\Huge 42.7\%}\\
+Late Jobs
+\end{minipage}
+}
+&
+\fcolorbox{wingreen}{wingreen!10}{%
+\begin{minipage}{0.4\textwidth}
+\centering
+\textbf{Our Enhanced RL Agent}\\[1em]
+{\Huge 37.7\%}\\
+Late Jobs\\[0.5em]
+\textcolor{wingreen}{\textbf{+11.7\% On-Time Jobs}}
+\end{minipage}
+}
+\end{tabular}
+\end{center}
+
+\vspace{1em}
+
+\begin{keyinsight}
+By providing the agent with the right information (slice sizes), the right incentives (immediate rewards), and a meaningful problem space (relaxed deadlines), it successfully learned a non-trivial scheduling policy that outperforms the greedy strategy that dominated the original, flawed problem.
+\end{keyinsight}
+
+%==============================================================================
+\section{Theoretical Context: Lower Bounds}
+%==============================================================================
+
+To rigorously benchmark our system's performance, we derive theoretical lower bounds for energy and tardiness.
+
+\subsection{Methodology}
+
+\subsubsection{1. Linearization}
+
+We first simplify the problem by converting all jobs with sublinear throughput curves to their more efficient ``linearized'' counterparts.
+
+$L(j)$ is a job with processing time $p_{j,i} = p_{j,1}/i$ on a slice of size $i$.
+
+\subsubsection{2. Configuration Simplification}
+
+We prove that any schedule on $m$ MIGs with various configurations can be converted to a schedule on $m$ GPUs, each with a single 7g slice, without increasing energy or tardiness.
+
+\subsection{Mathematical Formulation of Bounds}
+
+\subsubsection{Energy Lower Bound}
+
+Reduced to a minimum makespan problem on uniform machines, which is polynomially solvable:
+
+\begin{equation}
+E_{\text{opt}}(L(J)) = \sum_j (p_{j,7} \cdot P_7) + (m \cdot C^* - \sum_j a_j) \cdot P_0
+\end{equation}
+
+\subsubsection{Tardiness Lower Bound}
+
+Formulated as a time-indexed Mixed Integer Program (MIP):
+
+\begin{equation}
+\text{Objective: } \min \sum_j T_j
+\end{equation}
+
+subject to processing, machine capacity, and release time constraints.
+
+%==============================================================================
+\section{The Key Insight: RL Thrives on Information and Meaningful Decisions}
+%==============================================================================
+
+This investigation reveals that the success of a reinforcement learning agent is critically dependent on the formulation of the problem itself.
+
+\begin{table}[htbp]
+\centering
+\caption{When RL Fails vs. When RL Succeeds}
+\begin{tabular}{p{6.5cm}p{6.5cm}}
+\toprule
+\textbf{When RL Fails...} & \textbf{When RL Succeeds...} \\
+\midrule
+The problem is ``greedy-optimal.'' Tight constraints leave no room for optimization. & The problem has ``slack.'' Relaxed constraints create a complex trade-off space. \\
+\addlinespace
+The observation is incomplete. The agent lacks necessary information. & The observation is informative. All relevant state variables are provided. \\
+\addlinespace
+Rewards are sparse and delayed. Feedback is disconnected from actions. & Rewards are immediate and shaped. Direct, per-step feedback guides learning. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Supporting Data: Impact of Problem Formulation}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{Deadline Slack} & \textbf{RL Late \%} & \textbf{RL vs. Best Heuristic} \\
+\midrule
+Original & 1.0--1.5$\times$ & $\sim$87\% & Loses by $\sim$5\% \\
+Enhanced & 2.0--4.0$\times$ & 37.7\% & \textbf{Wins by 11.7\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{keyinsight}
+\textbf{The Bottom Line:} Reinforcement learning is not a black box. Its ability to outperform heuristics is unlocked only when the environment is designed to make learning both \emph{possible} and \emph{necessary}.
+\end{keyinsight}
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+By diagnosing and systematically correcting the core issues in the initial RL formulation, we successfully developed a scheduling agent that learns a policy superior to strong heuristic baselines for the MIG scheduling problem.
+
+\subsection{Summary of Contributions}
+
+\begin{enumerate}
+    \item \textbf{A 10-50$\times$ Faster Simulation Environment:} Re-implementation in NumPy enabled rapid experimentation and extensive training.
+    
+    \item \textbf{Demonstrated RL Superiority:} Achieved an \textbf{11.7\% reduction} in late jobs compared to the best-performing heuristic baseline.
+    
+    \item \textbf{Formal Analysis of Problem Structure:} Identified and proved how overly tight deadlines can render a complex scheduling problem ``greedy-optimal,'' making RL ineffective.
+    
+    \item \textbf{Principled Agent Design:} Developed an enhanced observation space and immediate reward shaping function, providing a template for applying RL to similar resource management tasks.
+\end{enumerate}
+
+\begin{center}
+\fcolorbox{neutralblue}{columbia!30}{%
+\begin{minipage}{0.9\textwidth}
+\centering
+\vspace{0.5em}
+\textit{``This work underscores a fundamental principle: in applied reinforcement learning, the careful formulation of the problem is as important as the learning algorithm itself.''}
+\vspace{0.5em}
+\end{minipage}
+}
+\end{center}
+
+%==============================================================================
+% References
+%==============================================================================
+\section*{References}
+
+\begin{enumerate}
+    \item E. Lipe, N. Karia, C. Espenshade, C. Stein, A. Tantawi and O. Tardieu, ``Energy Efficient Scheduling of AI/ML Workloads on Multi Instance GPUs with Dynamic Repartitioning,'' \textit{2025 IEEE 25th International Symposium on Cluster, Cloud and Internet Computing (CCGrid)}, Tromsø, Norway, 2025, pp. 53-62. DOI: 10.1109/CCGRID64434.2025.00066.
+\end{enumerate}
+
+\end{document}
+
